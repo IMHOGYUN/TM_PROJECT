@@ -18,7 +18,8 @@ from sklearn.neural_network import MLPClassifier
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
-import json # 상단에 추가
+import json 
+import joblib
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -27,10 +28,38 @@ warnings.filterwarnings('ignore')
 # 0. 기본 설정
 # ==========================================
 DATA_DIR = Path("data")
-TARGET_CHUNK_SIZE = 800  # 🌟 500어절 단위로 데이터 폭발(증강)
+TARGET_CHUNK_SIZE = 800  
 STOPWORDS = {'이', '가', '을', '를', '은', '는', '의', '에', '에서', '로', '으로', '와', '과', '도', '만', '하다', '있다', '없다', '되다', '이다', '그', '나', '내', '우리', '것', '수', '때', '곳', '말'}
 
 kiwi = Kiwi()
+
+# ==========================================
+# 🌟 [신규 추가] 거시적 문체 통계 지표 추출 함수
+# ==========================================
+def get_macro_stats(text):
+    total_chars = len(text.replace(" ", ""))
+    if total_chars == 0:
+        return [0.0, 0.0, 0.0, 0.0]
+        
+    # 1. 평균 문장 길이
+    sentences = [s.text for s in kiwi.split_into_sents(text)]
+    num_sentences = len(sentences) if len(sentences) > 0 else 1
+    avg_sentence_len = total_chars / num_sentences
+    
+    # 2. 대화문(따옴표)의 비율
+    quote_contents = re.findall(r'["\'「『](.*?)["\'」』]', text)
+    total_quote_chars = sum([len(qc.replace(" ", "")) for qc in quote_contents])
+    quote_ratio = total_quote_chars / total_chars
+    
+    # 3. 단문과 복문의 비율 (정규식 그룹핑 수정)
+    clause_connectors = len(re.findall(r'(?:[,며고나]|하야)\s', text))
+    complex_sentence_ratio = clause_connectors / num_sentences
+    
+    # 4. 특수 문장 부호 빈도
+    special_punctuations = len(re.findall(r'[!?…]+', text))
+    punctuation_density = special_punctuations / num_sentences
+
+    return [avg_sentence_len, quote_ratio, complex_sentence_ratio, punctuation_density]
 
 # ==========================================
 # 1 & 2. 데이터 로드 및 청크 단위 다중 피처 추출
@@ -42,7 +71,6 @@ def clean_text(text: str) -> str:
 
 print(f"\n[데이터 로딩 및 청크 분할 시작 (청크 크기: {TARGET_CHUNK_SIZE}어절)]")
 
-# 벤치마크에 쓸 5가지 리스트를 미리 준비
 raw_docs, word_docs, pos_docs, stats_features, tagged_data, labels = [], [], [], [], [], []
 authors_list = sorted([d.name for d in DATA_DIR.iterdir() if d.is_dir()])
 
@@ -58,13 +86,14 @@ for author in authors_list:
         cleaned_text = clean_text(text)
         words = cleaned_text.split()
         
-        # 소설을 청크 단위로 자르기
         for i in range(0, len(words), TARGET_CHUNK_SIZE):
             chunk_words = words[i:i+TARGET_CHUNK_SIZE]
             
-            # 절반 이상의 길이를 가진 청크만 훈련 데이터로 사용
             if len(chunk_words) >= TARGET_CHUNK_SIZE // 2:
                 chunk_text = ' '.join(chunk_words)
+                
+                # 🌟 거시적 통계 지표 추출 (전처리 전 원문 형태 유지)
+                macro_stats = get_macro_stats(chunk_text)
                 
                 # 형태소 분석
                 analyzed = kiwi.analyze(chunk_text)
@@ -76,26 +105,17 @@ for author in authors_list:
                         if len(lemma) > 1 and lemma not in STOPWORDS:
                             tokens.append(lemma)
                 
-                # 통계 피처 계산
-                sentences = kiwi.split_into_sents(chunk_text)
-                avg_sent_len = np.mean([len(s.text.split()) for s in sentences]) if sentences else 0
-                dialogues = re.findall(r'["\'「『](.*?)["\'」』]', chunk_text)
-                dialogue_ratio = sum(len(d) for d in dialogues) / len(chunk_text) if len(chunk_text) > 0 else 0
-                ttr = len(set([t.form for t in analyzed[0][0]])) / len(analyzed[0][0]) if analyzed[0][0] else 0
-                mod_density = sum(1 for t in pos_tags if t in ['VA', 'MAG']) / len(pos_tags) if pos_tags else 0
-                ef_density = sum(1 for t in pos_tags if t == 'EF') / len(pos_tags) if pos_tags else 0
-                
-                # 리스트에 차곡차곡 담기
+                # 리스트에 담기
                 raw_docs.append(chunk_text)
                 word_docs.append(" ".join(tokens))
                 pos_docs.append(" ".join(pos_tags))
-                stats_features.append([avg_sent_len, dialogue_ratio, ttr, mod_density, ef_density])
+                stats_features.append(macro_stats) # 추출한 4가지 통계 지표 저장
                 tagged_data.append(TaggedDocument(words=tokens, tags=[str(chunk_id)]))
                 labels.append(author)
                 chunk_id += 1
 
 y = np.array([authors_list.index(l) for l in labels])
-print(f"  ✅ 75편의 소설이 총 {len(raw_docs)}개의 데이터(Chunk)로 폭발적으로 증강되었습니다!")
+print(f"  ✅ 75편의 소설이 총 {len(raw_docs)}개의 데이터(Chunk)로 증강되었습니다!")
 
 # ==========================================
 # 3. 벡터화 및 전면 정규화(Scaling)
@@ -108,13 +128,10 @@ X_char_raw = vec_char.fit_transform(raw_docs).toarray()
 vec_pos = TfidfVectorizer(ngram_range=(2, 3), max_features=300, min_df=2)
 X_pos_raw = vec_pos.fit_transform(pos_docs).toarray()
 
-scaler_style = StandardScaler()
-X_style = scaler_style.fit_transform(stats_features)
-
 d2v_model = Doc2Vec(tagged_data, vector_size=100, window=5, min_count=2, workers=4, epochs=40, seed=42)
 X_d2v_raw = np.array([d2v_model.dv[str(i)] for i in range(len(raw_docs))])
 
-# 🌟 [핵심 수정] 3개의 피처 공간이 각자의 평균과 분산을 기억하도록 전용 스케일러(Scaler) 생성!
+# 🌟 각 4가지 피처의 스케일러 독립 생성
 scaler_d2v = StandardScaler()
 X_d2v = scaler_d2v.fit_transform(X_d2v_raw)
 
@@ -124,34 +141,38 @@ X_pos = scaler_pos.fit_transform(X_pos_raw)
 scaler_char = StandardScaler()
 X_char = scaler_char.fit_transform(X_char_raw)
 
+scaler_style = StandardScaler()
+X_style = scaler_style.fit_transform(stats_features)
+
 # ==========================================
-# 4. 동적 가중치 튜닝 (소프트 보팅 앙상블)
+# 4. 동적 가중치 튜닝 (소프트 보팅 앙상블 - 4중 결합)
 # ==========================================
 print("\n" + "="*70)
-print("🚀 [1단계] 동적 가중치 최적화 앙상블 실험 (수석 채점관: Logistic Regression)")
+print("🚀 [1단계] 4중 동적 가중치 최적화 앙상블 (수석 채점관: Logistic Regression)")
 print("="*70)
 
 cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-# 앞선 테스트에서 대승을 거둔 로지스틱 회귀를 메인 엔진으로 채택
 clf_voting = LogisticRegression(max_iter=1000, random_state=42)
 
 prob_d2v = cross_val_predict(clf_voting, X_d2v, y, cv=cv, method='predict_proba')
 prob_pos = cross_val_predict(clf_voting, X_pos, y, cv=cv, method='predict_proba')
 prob_char = cross_val_predict(clf_voting, X_char, y, cv=cv, method='predict_proba')
+prob_style = cross_val_predict(clf_voting, X_style, y, cv=cv, method='predict_proba')
 
 best_acc = 0.0
-best_weights = (0, 0, 0)
+best_weights = (0, 0, 0, 0)
 weight_range = np.arange(0.0, 1.05, 0.05)
 
-for w1, w2, w3 in itertools.product(weight_range, repeat=3):
-    if np.isclose(w1 + w2 + w3, 1.0):
-        blended_prob = (w1 * prob_d2v) + (w2 * prob_pos) + (w3 * prob_char)
+print(">> 4개의 피처에 대한 황금 가중치 탐색 중... (잠시만 기다려주세요)")
+for w1, w2, w3, w4 in itertools.product(weight_range, repeat=4):
+    if np.isclose(w1 + w2 + w3 + w4, 1.0):
+        blended_prob = (w1 * prob_d2v) + (w2 * prob_pos) + (w3 * prob_char) + (w4 * prob_style)
         acc = accuracy_score(y, np.argmax(blended_prob, axis=1))
         if acc > best_acc:
             best_acc = acc
-            best_weights = (w1, w2, w3)
+            best_weights = (w1, w2, w3, w4)
 
-print(f"🥇 최적의 황금 비율 : Doc2Vec {best_weights[0]*100:.0f}% / POS {best_weights[1]*100:.0f}% / Char {best_weights[2]*100:.0f}%")
+print(f"🥇 최적의 황금 비율 : Doc2Vec {best_weights[0]*100:.0f}% | POS {best_weights[1]*100:.0f}% | Char {best_weights[2]*100:.0f}% | Style {best_weights[3]*100:.0f}%")
 print(f"✨ 소프트 보팅 정확도: {best_acc*100:.2f}%")
 
 # ==========================================
@@ -161,11 +182,13 @@ print("\n" + "="*70)
 print("⚔️ [2단계] 알고리즘 × 데이터 조합 크로스 벤치마크 (Matrix Search)")
 print("="*70)
 
-X_all_combined = np.hstack([X_d2v, X_pos, X_char]) 
+# 🌟 4가지 데이터를 물리적으로 결합한 거대한 904차원 공간 생성!
+X_all_combined = np.hstack([X_d2v, X_pos, X_char, X_style]) 
 datasets = {
     "Doc2Vec (의미)": X_d2v,
     "POS N-gram (구문)": X_pos,
     "Char TF-IDF (리듬)": X_char,
+    "Macro Style (통계)": X_style,
     "Super Hybrid (결합)": X_all_combined
 }
 
@@ -219,34 +242,28 @@ for clf_name, model in classifiers.items():
         pass
 
 print(f"💡 핵심 물리적 결합 최고 점수: {best_core_clf} ({best_core_acc:.2f}%)")
-print(f"💡 확률적 결합(Soft Voting) 점수와 비교하여 결론을 도출하세요!")
 print("="*70)
 
 # ==========================================
 # 7. 🚀 [최종 배포용] 학습 완료된 뇌(Model) 영구 저장 (Export)
 # ==========================================
-import joblib
-
 print("\n" + "="*70)
 print("💾 [마무리] 최종 서비스용 AI 모델 저장 중...")
 print("="*70)
 
-# 저장할 폴더 만들기
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-# 1. 최종 결전 병기(분류기)를 100% 전체 데이터로 완벽하게 학습시킵니다.
-# (800어절 실험에서 1등을 차지했던 SVM 채택)
-print("  ▶ 100% 전체 데이터로 최종 AI 학습 중...")
+# 🌟 4명의 셰프(SVM)를 각 피처별로 학습
 final_clf_d2v = SVC(kernel='linear', probability=True, random_state=42).fit(X_d2v, y)
 final_clf_pos = SVC(kernel='linear', probability=True, random_state=42).fit(X_pos, y)
 final_clf_char = SVC(kernel='linear', probability=True, random_state=42).fit(X_char, y)
+final_clf_style = SVC(kernel='linear', probability=True, random_state=42).fit(X_style, y) # 스타일 셰프 추가
 
-# 2. 파이썬의 joblib을 이용해 모든 기억과 도구들을 압축 저장합니다.
-print("  ▶ 학습된 모델 및 정규화 도구(Scalers) 디스크에 쓰는 중...")
 joblib.dump(final_clf_d2v, MODEL_DIR / "clf_d2v.pkl")
 joblib.dump(final_clf_pos, MODEL_DIR / "clf_pos.pkl")
 joblib.dump(final_clf_char, MODEL_DIR / "clf_char.pkl")
+joblib.dump(final_clf_style, MODEL_DIR / "clf_style.pkl") # 저장
 
 joblib.dump(vec_pos, MODEL_DIR / "vec_pos.pkl")
 joblib.dump(vec_char, MODEL_DIR / "vec_char.pkl")
@@ -254,24 +271,21 @@ joblib.dump(vec_char, MODEL_DIR / "vec_char.pkl")
 joblib.dump(scaler_d2v, MODEL_DIR / "scaler_d2v.pkl")
 joblib.dump(scaler_pos, MODEL_DIR / "scaler_pos.pkl")
 joblib.dump(scaler_char, MODEL_DIR / "scaler_char.pkl")
+joblib.dump(scaler_style, MODEL_DIR / "scaler_style.pkl") # 스케일러 저장
 
-# Doc2Vec은 자체 저장 기능 사용
 d2v_model.save(str(MODEL_DIR / "doc2vec.model"))
-
-# 작가 이름 리스트(정답지)도 잊지 않고 저장
 joblib.dump(authors_list, MODEL_DIR / "authors_list.pkl")
 
-print("  ✅ 모든 훈련 데이터가 'models' 폴더에 성공적으로 박제되었습니다!")
-print("  이제 main.py를 다시 돌릴 필요 없이, chatbot.py만 실행하면 됩니다.")
-print("="*70)
-
+# 황금 가중치 4개 저장
 weights_dict = {
     "d2v": float(best_weights[0]),
     "pos": float(best_weights[1]),
-    "char": float(best_weights[2])
+    "char": float(best_weights[2]),
+    "style": float(best_weights[3]) # 스타일 가중치 추가
 }
 
 with open(MODEL_DIR / "golden_weights.json", "w", encoding="utf-8") as f:
     json.dump(weights_dict, f, indent=4)
 
-print("  ✅ 황금 가중치(golden_weights.json)까지 완벽하게 저장되었습니다!")
+print("  ✅ 4중 앙상블 모델 및 가중치가 완벽하게 저장되었습니다!")
+print("="*70)
